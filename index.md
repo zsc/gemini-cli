@@ -13,82 +13,82 @@
 
 ### 核心包（Core Package）
 
-#### 第 1 章：[架构概览与模块组织](./chapter01-architecture-overview.md)
+#### 第 1 章：[架构概览与模块组织](./chapter1.md)
 介绍 Gemini CLI 的整体架构设计，包括核心包与 CLI 包的职责划分、模块间的依赖关系，以及设计原则。
 
-#### 第 2 章：[Gemini API 集成层](./chapter02-gemini-integration.md)
+#### 第 2 章：[Gemini API 集成层](./chapter2.md)
 深入分析与 Google Gemini API 的集成实现，包括客户端初始化、请求构建、响应处理、错误重试机制等。
 
-#### 第 3 章：[工具系统架构](./chapter03-tool-system.md)
+#### 第 3 章：[工具系统架构](./chapter3.md)
 详解工具注册、发现、调度和执行的完整生命周期，包括 ToolRegistry、CoreToolScheduler 的设计，以及内置工具的实现模式。
 
-#### 第 4 章：[流式处理机制](./chapter04-streaming-architecture.md)
+#### 第 4 章：[流式处理机制](./chapter4.md)
 分析流式响应的处理架构，从 API 响应流到 UI 实时更新的完整链路，包括背压处理和错误恢复。
 
-#### 第 5 章：[Memory 系统设计](./chapter05-memory-system.md)
+#### 第 5 章：[Memory 系统设计](./chapter5.md)
 探讨分层上下文管理系统的设计，包括 GEMINI.md 文件的发现算法、内容合并策略、导入处理等。
 
-#### 第 6 章：[配置管理体系](./chapter06-configuration-system.md)
+#### 第 6 章：[配置管理体系](./chapter6.md)
 解析多层配置系统的实现，包括配置源优先级、合并策略、动态加载机制等。
 
 ### CLI 包（CLI Package）
 
-#### 第 7 章：[命令行界面架构](./chapter07-cli-architecture.md)
+#### 第 7 章：[命令行界面架构](./chapter7.md)
 分析基于 Ink/React 的 CLI 界面实现，包括组件架构、状态管理、键盘交互处理等。
 
-#### 第 8 章：[命令系统设计](./chapter08-command-system.md)
+#### 第 8 章：[命令系统设计](./chapter8.md)
 详解内置命令的实现模式、命令加载机制、自定义命令扩展等。
 
-#### 第 9 章：[交互式会话管理](./chapter09-session-management.md)
+#### 第 9 章：[交互式会话管理](./chapter9.md)
 探讨会话状态管理、历史记录、上下文维护、检查点等功能的实现。
 
 ### 扩展与集成
 
-#### 第 10 章：[MCP 协议集成](./chapter10-mcp-integration.md)
+#### 第 10 章：[MCP 协议集成](./chapter10.md)
 分析 Model Context Protocol 的集成实现，包括服务器发现、工具映射、通信协议等。
 
-#### 第 11 章：[VSCode 扩展实现](./chapter11-vscode-extension.md)
+#### 第 11 章：[VSCode 扩展实现](./chapter11.md)
 介绍 VSCode IDE Companion 扩展的架构，以及与 CLI 的通信机制。
 
 ## 第二部分：功能流程
 
 ### 核心工作流
 
-#### 第 12 章：[启动与初始化流程](./chapter12-startup-flow.md)
+#### 第 12 章：[启动与初始化流程](./chapter12.md)
 从用户执行 `gemini` 命令开始，追踪整个初始化过程，包括配置加载、认证、工具发现等。
 
-#### 第 13 章：[对话处理流程](./chapter13-conversation-flow.md)
+#### 第 13 章：[对话处理流程](./chapter13.md)
 分析用户输入到 AI 响应的完整处理链路，包括提示词构建、API 调用、流式响应处理等。
 
-#### 第 14 章：[工具执行流程](./chapter14-tool-execution-flow.md)
+#### 第 14 章：[工具执行流程](./chapter14.md)
 详解从 AI 请求工具调用到执行完成的全过程，包括参数验证、用户确认、并行执行、结果回传等。
 
-#### 第 15 章：[文件操作工作流](./chapter15-file-operations.md)
+#### 第 15 章：[文件操作工作流](./chapter15.md)
 分析文件读写、编辑、搜索等操作的实现，包括权限控制、冲突处理、差异显示等。
 
 ### 高级特性
 
-#### 第 16 章：[错误处理与恢复机制](./chapter16-error-handling.md)
+#### 第 16 章：[错误处理与恢复机制](./chapter16.md)
 总结各层级的错误处理策略，包括 API 错误、工具执行错误、网络异常等的处理方式。
 
-#### 第 17 章：[性能优化策略](./chapter17-performance-optimization.md)
+#### 第 17 章：[性能优化策略](./chapter17.md)
 探讨缓存机制、并发控制、资源管理等性能优化的实现。
 
-#### 第 18 章：[安全与隐私保护](./chapter18-security-privacy.md)
+#### 第 18 章：[安全与隐私保护](./chapter18.md)
 分析认证机制、数据保护、沙箱执行等安全相关的设计与实现。
 
-#### 第 19 章：[扩展开发指南](./chapter19-extension-development.md)
+#### 第 19 章：[扩展开发指南](./chapter19.md)
 为开发者提供扩展 Gemini CLI 的实践指南，包括自定义工具、MCP 服务器、命令开发等。
 
 ## 附录
 
-### 附录 A：[关键数据结构参考](./appendix-a-data-structures.md)
+### 附录 A：[关键数据结构参考](./appendix-a.md)
 列出核心数据结构和接口定义，便于快速查阅。
 
-### 附录 B：[配置选项完整列表](./appendix-b-configuration-reference.md)
+### 附录 B：[配置选项完整列表](./appendix-b.md)
 所有可用配置项的详细说明和示例。
 
-### 附录 C：[故障排查指南](./appendix-c-troubleshooting.md)
+### 附录 C：[故障排查指南](./appendix-c.md)
 常见问题的诊断和解决方法。
 
 ---
