@@ -7,6 +7,7 @@
 第一部分是按模块切分为多个 chapter
 第二部分是按功能和场景（跨模块）切分为多个 chapter
 整体组织为 index.md + chapter1.md + ...
+repo 本身的概述见 README.md
 
 ## 章节结构要求
 
