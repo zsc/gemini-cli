@@ -2,6 +2,12 @@
 
 文件操作是 Gemini CLI 的核心功能之一。本章将深入分析文件读写、编辑、搜索等操作的完整实现，包括权限控制、冲突处理、差异显示等关键机制。通过理解这些工作流，开发者可以更好地掌握 Gemini CLI 如何安全高效地管理文件系统操作。
 
+文件操作系统的设计体现了以下核心理念：
+- **安全性优先**：所有文件路径必须是绝对路径，并严格限制在项目根目录内
+- **智能化处理**：通过多级纠错策略自动处理常见问题，减少用户手动干预
+- **用户体验至上**：提供清晰的确认机制、丰富的视觉反馈和详细的错误信息
+- **性能优化**：采用缓存、流式处理和并行执行等技术提升效率
+
 ## 15.1 文件操作工具概览
 
 Gemini CLI 提供了一套完整的文件操作工具，位于 `packages/core/src/tools/` 目录下：
@@ -10,58 +16,147 @@ Gemini CLI 提供了一套完整的文件操作工具，位于 `packages/core/sr
 
 ```typescript
 // 文件操作工具集
-- ReadFileTool      // 读取文件内容
-- WriteFileTool     // 写入文件
-- EditTool          // 编辑文件（替换内容）
-- GlobTool          // 按模式查找文件
-- GrepTool          // 在文件中搜索内容
+- ReadFileTool      // 读取文件内容（支持文本、图像、PDF）
+- WriteFileTool     // 写入文件（支持差异预览）
+- EditTool          // 编辑文件（智能替换内容）
+- GlobTool          // 按模式查找文件（Git感知）
+- GrepTool          // 在文件中搜索内容（三级优化策略）
 - ListDirectoryTool // 列出目录内容
-- ReadManyFilesTool // 批量读取文件
+- ReadManyFilesTool // 批量读取文件（并行处理）
+```
+
+每个工具都有明确定义的静态名称，用于工具注册和调用：
+
+```typescript
+ReadFileTool.Name = 'read_file';
+WriteFileTool.Name = 'write_file';
+EditTool.Name = 'replace';
+GlobTool.Name = 'list_files';
+GrepTool.Name = 'search_file_content';
 ```
 
 每个工具都继承自 `BaseTool` 基类，实现了标准的工具接口：
 
 ```typescript
 abstract class BaseTool<TParams, TResult> {
+  // 参数验证，返回错误信息或 null
   validateToolParams(params: TParams): string | null;
+  
+  // 执行工具逻辑，支持中断信号
   execute(params: TParams, signal: AbortSignal): Promise<TResult>;
+  
+  // 可选：确认执行前的处理（用于危险操作）
   shouldConfirmExecute?(params: TParams): Promise<ToolCallConfirmationDetails | false>;
+  
+  // 获取工具描述（用于显示）
   getDescription(params: TParams): string;
+  
+  // 获取工具影响的文件位置
+  toolLocations?(params: TParams): ToolLocation[];
+}
+
+// 修改类工具的特殊接口
+interface ModifiableTool<TParams> {
+  // 用户修改参数后的回调
+  onUserModifiedParams?(context: ModifyContext): Promise<void>;
 }
 ```
 
 ### 15.1.2 工具特性对比
 
-| 工具 | 需要确认 | 支持修改 | 批量操作 | 性能优化 |
-|------|----------|----------|----------|----------|
-| ReadFileTool | ❌ | ❌ | ❌ | ✅ 流式读取 |
-| WriteFileTool | ✅ | ✅ | ❌ | ✅ 差异计算 |
-| EditTool | ✅ | ✅ | ✅ | ✅ 智能纠错 |
-| GlobTool | ❌ | ❌ | ✅ | ✅ Git 感知 |
-| GrepTool | ❌ | ❌ | ✅ | ✅ 三级策略 |
+| 工具 | 需要确认 | 支持修改 | 批量操作 | 性能优化 | 特殊能力 |
+|------|----------|----------|----------|----------|----------|
+| ReadFileTool | ❌ | ❌ | ❌ | ✅ 流式读取 | 支持图像/PDF、行号范围 |
+| WriteFileTool | ✅ | ✅ | ❌ | ✅ 差异计算 | 自动纠错、新文件检测 |
+| EditTool | ✅ | ✅ | ✅ | ✅ 智能纠错 | LLM辅助纠错、多次替换 |
+| GlobTool | ❌ | ❌ | ✅ | ✅ Git 感知 | .gitignore/.geminiignore |
+| GrepTool | ❌ | ❌ | ✅ | ✅ 三级策略 | 正则表达式、Git grep |
+
+### 15.1.3 工具参数验证
+
+所有工具都使用 `SchemaValidator` 进行参数验证，确保类型安全：
+
+```typescript
+// 使用 Google Genai SDK 的 Type 定义
+import { Type } from '@google/genai';
+
+// 参数模式定义示例
+const schema = {
+  properties: {
+    absolute_path: {
+      description: 'The absolute path to the file',
+      type: Type.STRING,
+    },
+    offset: {
+      description: 'Optional: 0-based line number to start',
+      type: Type.NUMBER,
+    }
+  },
+  required: ['absolute_path'],
+  type: Type.OBJECT,
+};
+```
 
 ## 15.2 文件读取工作流
 
 ### 15.2.1 ReadFileTool 实现
 
-文件读取是最基础的操作，`ReadFileTool` 提供了灵活的读取能力：
+文件读取是最基础的操作，`ReadFileTool` 提供了灵活的读取能力，支持文本、图像（PNG、JPG、GIF、WEBP、SVG、BMP）和 PDF 文件：
 
 ```typescript
 export interface ReadFileToolParams {
   absolute_path: string;  // 必须是绝对路径
-  offset?: number;        // 起始行号（0-based）
-  limit?: number;         // 读取行数限制
+  offset?: number;        // 起始行号（0-based），文本文件专用
+  limit?: number;         // 读取行数限制，文本文件专用
 }
 
 class ReadFileTool extends BaseTool<ReadFileToolParams, ToolResult> {
-  async execute(params: ReadFileToolParams): Promise<ToolResult> {
-    // 1. 参数验证
+  static readonly Name: string = 'read_file';
+  
+  constructor(private config: Config) {
+    super(
+      ReadFileTool.Name,
+      'ReadFile',
+      'Reads and returns the content of a specified file from the local filesystem. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), and PDF files. For text files, it can read specific line ranges.',
+      Icon.FileSearch,
+      // ... schema definition
+    );
+  }
+
+  validateToolParams(params: ReadFileToolParams): string | null {
+    // 1. 模式验证
+    const errors = SchemaValidator.validate(this.schema.parameters, params);
+    if (errors) return errors;
+    
+    // 2. 路径验证
+    if (!path.isAbsolute(params.absolute_path)) {
+      return `File path must be absolute, but was relative: ${params.absolute_path}`;
+    }
+    
+    // 3. 安全性验证
+    if (!isWithinRoot(params.absolute_path, this.config.getTargetDir())) {
+      return `File path must be within the root directory`;
+    }
+    
+    // 4. .geminiignore 检查
+    const fileService = this.config.getFileService();
+    if (fileService.shouldGeminiIgnoreFile(params.absolute_path)) {
+      return `File path is ignored by .geminiignore pattern(s).`;
+    }
+    
+    return null;
+  }
+
+  async execute(params: ReadFileToolParams, signal: AbortSignal): Promise<ToolResult> {
     const validationError = this.validateToolParams(params);
     if (validationError) {
-      return { llmContent: `Error: ${validationError}` };
+      return {
+        llmContent: `Error: Invalid parameters provided. Reason: ${validationError}`,
+        returnDisplay: validationError,
+      };
     }
 
-    // 2. 调用统一的文件处理函数
+    // 调用统一的文件处理函数
     const result = await processSingleFileContent(
       params.absolute_path,
       this.config.getTargetDir(),
@@ -69,23 +164,34 @@ class ReadFileTool extends BaseTool<ReadFileToolParams, ToolResult> {
       params.limit
     );
 
-    // 3. 记录遥测数据
-    recordFileOperationMetric(
-      this.config,
-      FileOperation.READ,
-      lines,
-      mimetype,
-      extension
-    );
+    // 记录遥测数据
+    if (!result.error) {
+      const lines = typeof result.llmContent === 'string'
+        ? result.llmContent.split('\n').length
+        : undefined;
+      const mimetype = getSpecificMimeType(params.absolute_path);
+      recordFileOperationMetric(
+        this.config,
+        FileOperation.READ,
+        lines,
+        mimetype,
+        path.extname(params.absolute_path)
+      );
+    }
 
     return result;
+  }
+  
+  // 提供文件位置信息，用于 IDE 集成
+  toolLocations(params: ReadFileToolParams): ToolLocation[] {
+    return [{ path: params.absolute_path, line: params.offset }];
   }
 }
 ```
 
 ### 15.2.2 文件类型检测与处理
 
-`fileUtils.ts` 中的 `processSingleFileContent` 函数负责处理不同类型的文件：
+`fileUtils.ts` 中的文件类型检测系统基于文件扩展名和内容分析：
 
 ```typescript
 export async function processSingleFileContent(
