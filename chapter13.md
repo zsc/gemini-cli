@@ -45,12 +45,17 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   config,
   slashCommands,
   commandContext,
-  // ...
+  placeholder = '  Type your message or @path/to/file',
+  focus = true,
+  inputWidth,
+  suggestionsWidth,
+  shellModeActive,
+  setShellModeActive,
+  vimHandleInput,
 }) => {
-  // 多行输入支持
   const [justNavigatedHistory, setJustNavigatedHistory] = useState(false);
   
-  // 自动补全
+  // 自动补全系统集成
   const completion = useCompletion(
     buffer,
     config.getTargetDir(),
@@ -59,52 +64,181 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     config,
   );
   
-  // Shell 历史
+  // Shell 历史管理
   const shellHistory = useShellHistory(config.getProjectRoot());
   
-  // 输入历史导航
-  const inputHistory = useInputHistory({
-    userMessages,
-    onSubmit: handleSubmitAndClear,
-    isActive: !completion.showSuggestions && !shellModeActive,
-    currentQuery: buffer.text,
-    onChange: customSetTextAndResetCompletionSignal,
-  });
+  // 处理提交并清空输入
+  const handleSubmitAndClear = useCallback(
+    (submittedValue: string) => {
+      if (shellModeActive) {
+        shellHistory.addCommandToHistory(submittedValue);
+      }
+      // 在调用 onSubmit 之前清空缓冲区，防止重复提交
+      buffer.setText('');
+      onSubmit(submittedValue);
+      resetCompletionState();
+    },
+    [onSubmit, buffer, resetCompletionState, shellModeActive, shellHistory],
+  );
 }
 ```
 
 ### 2.2 TextBuffer 管理
 
-TextBuffer 提供了强大的文本编辑能力：
+TextBuffer 提供了强大的文本编辑能力，支持多种编辑操作：
 
-- 多行编辑支持
-- 光标移动和定位
-- 文本插入和删除
-- Vim 模式集成
+```typescript
+export type Direction = 
+  | 'left' | 'right' | 'up' | 'down' 
+  | 'wordLeft' | 'wordRight' 
+  | 'home' | 'end';
+
+// Vim 风格的单词边界查找
+export const findNextWordStart = (
+  text: string,
+  currentOffset: number,
+): number => {
+  let i = currentOffset;
+  if (i >= text.length) return i;
+
+  const currentChar = text[i];
+  
+  // 根据字符类型跳过当前单词/序列
+  if (/\w/.test(currentChar)) {
+    // 跳过当前单词字符
+    while (i < text.length && /\w/.test(text[i])) {
+      i++;
+    }
+  } else if (!/\s/.test(currentChar)) {
+    // 跳过当前非单词、非空白字符（如 "/", "." 等）
+    while (i < text.length && !/\w/.test(text[i]) && !/\s/.test(text[i])) {
+      i++;
+    }
+  }
+  
+  // 跳过空白
+  while (i < text.length && /\s/.test(text[i])) {
+    i++;
+  }
+  
+  return i;
+};
+```
+
+TextBuffer 的核心功能包括：
+- **多行编辑**: 支持换行和多行文本管理
+- **光标控制**: 精确的光标定位和移动
+- **Unicode 支持**: 正确处理多字节字符
+- **Vim 集成**: 支持 Vim 模式的移动和编辑命令
 
 ### 2.3 特殊输入处理
 
-系统支持多种特殊输入：
+系统支持多种特殊输入，每种都有专门的处理逻辑：
 
 1. **@ 命令**: 引用文件或上下文
+   - 触发文件路径自动补全
+   - 支持相对和绝对路径
+   - 实时读取文件内容
+
 2. **/ 命令**: 执行内置或自定义命令
+   - 动态加载可用命令列表
+   - 命令参数自动补全
+   - 支持命令别名
+
 3. **Shell 模式**: 直接执行 shell 命令
+   - 专用的 shell 历史记录
+   - 命令输出实时流式显示
+   - 支持中断执行
+
 4. **剪贴板图片**: Ctrl+V 粘贴图片
+   ```typescript
+   // 剪贴板图片处理
+   if (clipboardHasImage()) {
+     const imagePath = await saveClipboardImage();
+     cleanupOldClipboardImages(); // 清理旧的临时图片
+     buffer.insert(`@${imagePath} `);
+   }
+   ```
+
+### 2.4 键盘事件处理
+
+InputPrompt 使用 useKeypress Hook 处理各种键盘输入：
+
+```typescript
+useKeypress(
+  (key: Key) => {
+    // Vim 模式优先处理
+    if (vimHandleInput && vimHandleInput(key)) {
+      return;
+    }
+    
+    // 特殊键处理
+    switch (key.name) {
+      case 'return':
+        if (!key.shift && !buffer.text.includes('\n')) {
+          handleSubmitAndClear(buffer.text);
+        } else {
+          buffer.insert('\n');
+        }
+        break;
+        
+      case 'tab':
+        if (completion.showSuggestions) {
+          completion.acceptSuggestion();
+        }
+        break;
+        
+      case 'escape':
+        if (completion.showSuggestions) {
+          completion.resetCompletionState();
+        } else if (shellModeActive) {
+          setShellModeActive(false);
+        }
+        break;
+    }
+  },
+  { isActive: focus }
+);
 
 ## 3. 提示词构建
 
 ### 3.1 系统提示生成
 
-getCoreSystemPrompt 函数构建核心系统指令：
+getCoreSystemPrompt 函数构建核心系统指令，支持灵活的配置和自定义：
 
 ```typescript
 export function getCoreSystemPrompt(userMemory?: string): string {
-  // 检查自定义系统提示
+  // 支持通过环境变量 GEMINI_SYSTEM_MD 自定义系统提示
+  let systemMdEnabled = false;
   let systemMdPath = path.resolve(path.join(GEMINI_CONFIG_DIR, 'system.md'));
+  const systemMdVar = process.env.GEMINI_SYSTEM_MD;
   
+  if (systemMdVar) {
+    const systemMdVarLower = systemMdVar.toLowerCase();
+    if (!['0', 'false'].includes(systemMdVarLower)) {
+      systemMdEnabled = true;
+      
+      // 支持自定义路径
+      if (!['1', 'true'].includes(systemMdVarLower)) {
+        let customPath = systemMdVar;
+        // 处理 ~ 路径
+        if (customPath.startsWith('~/')) {
+          customPath = path.join(os.homedir(), customPath.slice(2));
+        }
+        systemMdPath = path.resolve(customPath);
+      }
+      
+      // 确保文件存在
+      if (!fs.existsSync(systemMdPath)) {
+        throw new Error(`missing system prompt file '${systemMdPath}'`);
+      }
+    }
+  }
+  
+  // 使用自定义或默认系统提示
   const basePrompt = systemMdEnabled
     ? fs.readFileSync(systemMdPath, 'utf8')
-    : `You are an interactive CLI agent specializing in software engineering tasks...`;
+    : getDefaultSystemPrompt();
     
   // 添加上下文感知内容
   const contextPrompt = getContextualPrompt();
@@ -116,29 +250,128 @@ export function getCoreSystemPrompt(userMemory?: string): string {
 }
 ```
 
+默认系统提示包含详细的行为指导：
+
+```typescript
+const getDefaultSystemPrompt = () => `
+You are an interactive CLI agent specializing in software engineering tasks. 
+
+# Core Mandates
+- **Conventions:** Rigorously adhere to existing project conventions
+- **Libraries/Frameworks:** NEVER assume availability - verify usage first
+- **Style & Structure:** Mimic existing code patterns
+- **Comments:** Add sparingly, focus on *why* not *what*
+- **Proactiveness:** Fulfill requests thoroughly including implied actions
+- **Path Construction:** Always use absolute paths for file operations
+
+# Primary Workflows
+## Software Engineering Tasks
+1. **Understand:** Use search tools extensively to understand codebase
+2. **Plan:** Build coherent plan based on understanding
+3. **Implement:** Use tools strictly adhering to conventions
+4. **Verify (Tests):** Run tests using project's procedures
+5. **Verify (Standards):** Run linting and type-checking
+
+## New Applications
+1. **Understand Requirements:** Analyze core features and constraints
+2. **Propose Plan:** Present high-level summary with key technologies
+3. **User Approval:** Obtain explicit approval
+4. **Implementation:** Autonomously implement with all tools
+5. **Verify:** Review, fix bugs, ensure no compile errors
+6. **Solicit Feedback:** Provide startup instructions
+`;
+```
+
 ### 3.2 上下文收集
 
-对话上下文包括：
+对话上下文收集涉及多个来源的整合：
 
 1. **GEMINI.md 文件**: 项目特定指令
+   - 支持分层查找（从当前目录向上）
+   - 支持导入其他文件
+   - 自动去重和合并
+
 2. **IDE 上下文**: 打开的文件和选中内容
+   ```typescript
+   const ideContext = await config.getIdeContext();
+   if (ideContext) {
+     // 添加打开的文件列表
+     if (ideContext.openFiles.length > 0) {
+       contextParts.push(`Open files: ${ideContext.openFiles.join(', ')}`);
+     }
+     
+     // 添加选中的代码
+     if (ideContext.selectedCode) {
+       contextParts.push(`Selected code:\n${ideContext.selectedCode}`);
+     }
+   }
+   ```
+
 3. **会话历史**: 之前的对话轮次
+   - 自动裁剪以控制上下文长度
+   - 保留重要的工具调用结果
+   - 支持压缩长对话
+
 4. **工具结果**: 之前执行的工具输出
+   - 智能筛选相关结果
+   - 格式化为结构化信息
+   - 避免重复信息
 
 ### 3.3 Memory 系统集成
 
-Memory 系统提供分层的上下文管理：
+Memory 系统提供分层的上下文管理，支持复杂的项目结构：
 
 ```typescript
-const { memoryContent, fileCount } = await loadHierarchicalGeminiMemory(
-  process.cwd(),
-  config.getDebugMode(),
-  config.getFileService(),
-  settings.merged,
-  config.getExtensionContextFilePaths(),
-  config.getFileFilteringOptions(),
-);
+export async function loadHierarchicalGeminiMemory(
+  startDir: string,
+  debugMode: boolean,
+  fileService: FileService,
+  settings: Settings,
+  extensionContextFilePaths: string[],
+  fileFilteringOptions: FileFilteringOptions,
+): Promise<{ memoryContent: string; fileCount: number }> {
+  const processedFiles = new Set<string>();
+  const contentParts: string[] = [];
+  
+  // 1. 查找所有 GEMINI.md 文件
+  const memoryFiles = await findGeminiMemoryFiles(startDir);
+  
+  // 2. 处理每个文件，包括导入
+  for (const file of memoryFiles) {
+    const content = await processMemoryFile(
+      file,
+      processedFiles,
+      fileService,
+      settings,
+      fileFilteringOptions,
+    );
+    
+    if (content) {
+      contentParts.push(content);
+    }
+  }
+  
+  // 3. 添加扩展提供的上下文
+  for (const contextPath of extensionContextFilePaths) {
+    const content = await fileService.readFile(contextPath);
+    contentParts.push(`\n## Extension Context: ${contextPath}\n${content}`);
+  }
+  
+  // 4. 合并和格式化
+  const memoryContent = contentParts.join('\n\n---\n\n');
+  
+  return {
+    memoryContent,
+    fileCount: processedFiles.size,
+  };
+}
 ```
+
+Memory 文件支持的特性：
+- **导入语法**: `@import ./path/to/file.md`
+- **代码块引用**: 自动读取引用的代码文件
+- **条件包含**: 基于环境或配置的条件内容
+- **变量替换**: 支持项目路径等变量
 
 ## 4. API 请求生成
 
