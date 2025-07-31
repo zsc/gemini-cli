@@ -17,16 +17,35 @@ export enum AuthType {
 }
 ```
 
-每种认证方式都有其特定的安全考量：
+每种认证方式都有其特定的安全考量和验证逻辑（`packages/cli/src/config/auth.ts`）：
 
 1. **Google 登录认证**：使用 OAuth 2.0 流程，支持 PKCE（Proof Key for Code Exchange）以增强安全性
 2. **Cloud Shell 认证**：利用 Google Cloud Shell 的 ADC（Application Default Credentials）
 3. **Gemini API Key**：通过环境变量配置，适合 CI/CD 环境
-4. **Vertex AI 认证**：支持项目级别的访问控制
+4. **Vertex AI 认证**：支持项目级别的访问控制，可以使用 GOOGLE_API_KEY 或 GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION 组合
+
+认证方法验证确保了必要的环境变量和配置存在：
+
+```typescript
+// packages/cli/src/config/auth.ts
+export const validateAuthMethod = (authMethod: string): string | null => {
+  loadEnvironment(); // 支持从 .env 文件加载配置
+  
+  if (authMethod === AuthType.USE_VERTEX_AI) {
+    const hasVertexProjectLocationConfig =
+      !!process.env.GOOGLE_CLOUD_PROJECT && !!process.env.GOOGLE_CLOUD_LOCATION;
+    const hasGoogleApiKey = !!process.env.GOOGLE_API_KEY;
+    if (!hasVertexProjectLocationConfig && !hasGoogleApiKey) {
+      return '详细的错误提示...';
+    }
+  }
+  // 其他认证方式的验证...
+}
+```
 
 ### 18.1.2 OAuth 2.0 安全实现
 
-OAuth 实现采用了业界最佳实践：
+OAuth 实现采用了业界最佳实践，特别是在 MCP OAuth 支持中（`packages/core/src/mcp/oauth-provider.ts`）：
 
 ```typescript
 // OAuth 安全配置
@@ -38,18 +57,40 @@ const OAUTH_SCOPE = [
 ];
 
 // PKCE 实现
-const codeVerifier = await client.generateCodeVerifierAsync();
-const state = crypto.randomBytes(32).toString('hex');
+interface PKCEParams {
+  codeVerifier: string;
+  codeChallenge: string;
+  state: string;
+}
 ```
 
 关键安全特性：
-- **状态参数验证**：防止 CSRF 攻击
-- **代码验证器**：PKCE 机制防止授权码拦截
+- **状态参数验证**：每次认证流程生成唯一的 state 参数，防止 CSRF 攻击
+- **代码验证器**：PKCE 机制使用 code_verifier 和 code_challenge，防止授权码拦截
 - **最小权限原则**：仅请求必要的 OAuth 作用域
+- **动态客户端注册**：支持 OAuth 动态客户端注册，增强灵活性
+
+MCP OAuth 提供了完整的 OAuth 2.0 流程实现：
+
+```typescript
+// packages/core/src/mcp/oauth-provider.ts
+export class MCPOAuthProvider {
+  private static readonly REDIRECT_PORT = 7777;
+  private static readonly REDIRECT_PATH = '/oauth/callback';
+  
+  // 支持动态客户端注册
+  static async registerClient(
+    registrationUrl: string,
+    config: MCPOAuthConfig
+  ): Promise<OAuthClientRegistrationResponse> {
+    // 实现细节...
+  }
+}
+```
 
 ### 18.1.3 凭证存储安全
 
-凭证存储采用了多重保护措施：
+凭证存储采用了多重保护措施（`packages/core/src/mcp/oauth-token-storage.ts`）：
 
 ```typescript
 // 凭证文件权限设置
@@ -60,15 +101,45 @@ await fs.writeFile(
 );
 ```
 
-存储位置：
-- OAuth 凭证：`~/.gemini/oauth_creds.json`
-- MCP 令牌：`~/.gemini/mcp-oauth-tokens.json`
+存储架构：
+- **集中管理**：所有凭证存储在用户目录下的 `.gemini` 文件夹
+- **分类存储**：
+  - OAuth 凭证：`~/.gemini/oauth_creds.json`
+  - MCP 令牌：`~/.gemini/mcp-oauth-tokens.json`
+- **结构化存储**：使用标准化的接口定义
+
+```typescript
+// MCP OAuth 凭证结构
+export interface MCPOAuthCredentials {
+  serverName: string;
+  token: MCPOAuthToken;
+  clientId?: string;
+  tokenUrl?: string;
+  mcpServerUrl?: string;
+  updatedAt: number; // 时间戳用于跟踪更新
+}
+```
+
+凭证管理类提供了安全的 CRUD 操作：
+
+```typescript
+export class MCPOAuthTokenStorage {
+  private static readonly TOKEN_FILE = 'mcp-oauth-tokens.json';
+  private static readonly CONFIG_DIR = '.gemini';
+  
+  // 确保配置目录存在
+  private static async ensureConfigDir(): Promise<void> {
+    const configDir = path.dirname(this.getTokenFilePath());
+    await fs.mkdir(configDir, { recursive: true });
+  }
+}
+```
 
 ## 18.2 沙箱执行环境
 
 ### 18.2.1 容器沙箱
 
-Gemini CLI 支持通过 Docker 或 Podman 运行在隔离的容器环境中：
+Gemini CLI 支持通过 Docker 或 Podman 运行在隔离的容器环境中（`packages/cli/src/utils/sandbox.ts`）：
 
 ```typescript
 const args = [
@@ -79,22 +150,131 @@ const args = [
 ];
 ```
 
-安全特性：
-- **文件系统隔离**：仅挂载必要的目录
-- **网络隔离**：可选的内部网络配置
-- **用户权限映射**：避免容器内的 root 权限问题
-- **环境变量过滤**：仅传递必要的环境变量
+容器沙箱的关键安全特性：
+
+1. **用户权限映射**：智能处理容器内的用户权限问题
+   ```typescript
+   // 自动检测是否需要使用当前用户的 UID/GID
+   async function shouldUseCurrentUserInSandbox(): Promise<boolean> {
+     const envVar = process.env.SANDBOX_SET_UID_GID?.toLowerCase().trim();
+     
+     // 对 Debian/Ubuntu 系统默认启用，避免权限问题
+     if (os.platform() === 'linux') {
+       const osReleaseContent = await readFile('/etc/os-release', 'utf8');
+       if (osReleaseContent.includes('ID=debian') || 
+           osReleaseContent.includes('ID=ubuntu')) {
+         return true;
+       }
+     }
+     return false;
+   }
+   ```
+
+2. **文件系统隔离**：仅挂载必要的目录，支持跨平台路径转换
+   ```typescript
+   function getContainerPath(hostPath: string): string {
+     if (os.platform() !== 'win32') {
+       return hostPath;
+     }
+     // Windows 路径转换为容器路径格式
+     const withForwardSlashes = hostPath.replace(/\\/g, '/');
+     const match = withForwardSlashes.match(/^([A-Z]):\/(.*)/i);
+     if (match) {
+       return `/${match[1].toLowerCase()}/${match[2]}`;
+     }
+     return hostPath;
+   }
+   ```
+
+3. **环境变量管理**：智能处理 PATH 和 PYTHONPATH 等关键环境变量
+   ```typescript
+   // 仅映射工作目录内的路径到容器
+   if (process.env.PATH) {
+     const paths = process.env.PATH.split(pathSeparator);
+     for (const p of paths) {
+       const containerPath = getContainerPath(p);
+       if (containerPath.toLowerCase().startsWith(containerWorkdir.toLowerCase())) {
+         pathSuffix += `:${containerPath}`;
+       }
+     }
+   }
+   ```
+
+4. **端口映射**：支持通过环境变量配置端口转发
+   ```typescript
+   function ports(): string[] {
+     return (process.env.SANDBOX_PORTS ?? '')
+       .split(',')
+       .filter((p) => p.trim())
+       .map((p) => p.trim());
+   }
+   
+   // 使用 socat 进行端口转发
+   ports().forEach((p) =>
+     shellCmds.push(
+       `socat TCP4-LISTEN:${p},bind=$(hostname -i),fork,reuseaddr TCP4:127.0.0.1:${p} 2> /dev/null &`
+     )
+   );
+   ```
+
+5. **自定义初始化**：支持项目级别的沙箱配置
+   ```typescript
+   const projectSandboxBashrc = path.join(SETTINGS_DIRECTORY_NAME, 'sandbox.bashrc');
+   if (fs.existsSync(projectSandboxBashrc)) {
+     shellCmds.push(`source ${getContainerPath(projectSandboxBashrc)};`);
+   }
+   ```
 
 ### 18.2.2 macOS Seatbelt 沙箱
 
-在 macOS 上，支持使用系统原生的 Seatbelt 沙箱：
+在 macOS 上，支持使用系统原生的 Seatbelt 沙箱技术：
 
+```typescript
+const BUILTIN_SEATBELT_PROFILES = [
+  'permissive-open',      // 宽松模式，允许网络访问
+  'permissive-closed',    // 宽松模式，禁止网络访问
+  'permissive-proxied',   // 宽松模式，通过代理访问网络
+  'restrictive-open',     // 严格模式，允许网络访问
+  'restrictive-closed',   // 严格模式，禁止网络访问
+  'restrictive-proxied',  // 严格模式，通过代理访问网络
+];
 ```
-沙箱配置文件：
-- permissive-open：宽松模式，允许网络访问
-- permissive-closed：宽松模式，禁止网络访问
-- restrictive-open：严格模式，允许网络访问
-- restrictive-closed：严格模式，禁止网络访问
+
+Seatbelt 沙箱的实现细节：
+
+```typescript
+// packages/cli/src/utils/sandbox.ts
+if (config.command === 'sandbox-exec') {
+  const profile = (process.env.SEATBELT_PROFILE ??= 'permissive-open');
+  let profileFile = new URL(`sandbox-macos-${profile}.sb`, import.meta.url).pathname;
+  
+  // 支持自定义配置文件
+  if (!BUILTIN_SEATBELT_PROFILES.includes(profile)) {
+    profileFile = path.join(SETTINGS_DIRECTORY_NAME, `sandbox-macos-${profile}.sb`);
+  }
+  
+  // 传递必要的目录访问权限
+  const args = [
+    '-D', `TARGET_DIR=${fs.realpathSync(process.cwd())}`,
+    '-D', `TMP_DIR=${fs.realpathSync(os.tmpdir())}`,
+    '-D', `HOME_DIR=${fs.realpathSync(os.homedir())}`,
+    '-D', `CACHE_DIR=${fs.realpathSync(execSync(`getconf DARWIN_USER_CACHE_DIR`).toString().trim())}`,
+    '-f', profileFile,
+    // ...
+  ];
+}
+```
+
+代理支持：
+```typescript
+// 支持在沙箱内使用代理
+if (proxyCommand) {
+  const proxy = process.env.HTTPS_PROXY || 
+                process.env.HTTP_PROXY || 
+                'http://localhost:8877';
+  sandboxEnv['HTTPS_PROXY'] = proxy;
+  sandboxEnv['https_proxy'] = proxy; // 兼容小写环境变量
+}
 ```
 
 ### 18.2.3 沙箱配置管理
@@ -119,6 +299,11 @@ function getSandboxCommand(sandbox?: boolean | string): SandboxConfig['command']
   }
 }
 ```
+
+沙箱环境的识别：
+- 容器沙箱：检查 `process.env.SANDBOX` 的值（如 'docker', 'podman'）
+- macOS Seatbelt：`process.env.SANDBOX === 'sandbox-exec'`
+- 支持嵌套检测，避免双重沙箱
 
 ## 18.3 文件系统安全
 
