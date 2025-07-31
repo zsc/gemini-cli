@@ -15,9 +15,17 @@ Gemini CLI 支持以下几种扩展方式：
 
 ### 扩展加载机制
 
-扩展从以下位置加载：
-- **工作区扩展**：`.gemini/extensions/`
+扩展系统的核心实现位于 `packages/cli/src/config/extension.ts`。扩展从以下位置按优先级加载：
+
+- **工作区扩展**：`{workspaceDir}/.gemini/extensions/`
 - **用户扩展**：`~/.gemini/extensions/`
+
+当存在同名扩展时，工作区扩展会覆盖用户扩展。扩展加载过程会：
+1. 扫描所有扩展目录下的子目录
+2. 查找每个子目录中的 `gemini-extension.json` 配置文件
+3. 验证配置文件的有效性（必须包含 name 和 version 字段）
+4. 收集扩展的上下文文件
+5. 根据用户配置决定扩展是否激活
 
 每个扩展必须包含 `gemini-extension.json` 配置文件：
 
@@ -27,23 +35,37 @@ Gemini CLI 支持以下几种扩展方式：
   "version": "1.0.0",
   "mcpServers": {
     "my-server": {
-      "command": "node my-mcp-server.js"
+      "command": "node my-mcp-server.js",
+      "args": ["--port", "3000"],
+      "env": {
+        "API_KEY": "${MY_API_KEY}"
+      },
+      "cwd": "server",
+      "timeout": 30000,
+      "trust": false
     }
   },
-  "contextFileName": "GEMINI.md",
+  "contextFileName": ["GEMINI.md", "API.md"],
   "excludeTools": ["tool-to-exclude"]
 }
 ```
+
+### 扩展激活控制
+
+用户可以通过配置文件的 `enabledExtensions` 字段控制扩展激活：
+- 空数组或未定义：激活所有扩展
+- `["none"]`：禁用所有扩展
+- `["ext1", "ext2"]`：只激活指定的扩展
 
 ## 自定义工具开发
 
 ### 方式一：命令行工具发现
 
-通过配置 `toolDiscoveryCommand` 和 `toolCallCommand`，可以让 Gemini CLI 发现和调用外部工具。
+通过配置 `toolDiscoveryCommand` 和 `toolCallCommand`，可以让 Gemini CLI 发现和调用外部工具。这种机制的实现位于 `packages/core/src/tools/tool-registry.ts`。
 
 #### 1. 实现发现命令
 
-发现命令应返回 FunctionDeclaration 数组的 JSON：
+发现命令应返回 FunctionDeclaration 数组的 JSON。系统会执行配置的命令，并解析标准输出：
 
 ```javascript
 // discover-tools.js
@@ -72,9 +94,16 @@ const tools = [
 console.log(JSON.stringify(tools));
 ```
 
+发现命令的实现要点：
+- 输出必须是有效的 JSON 格式
+- 支持返回单个工具对象或工具数组
+- 支持嵌套在 `tool` 或 `tools` 字段中的声明
+- 标准输出大小限制为 10MB
+- 支持使用 shell 引号解析命令参数
+
 #### 2. 实现调用命令
 
-调用命令接收工具名作为参数，从 stdin 读取参数 JSON：
+调用命令接收工具名作为第一个参数，从 stdin 读取参数 JSON：
 
 ```javascript
 // call-tool.js
@@ -86,12 +115,25 @@ process.stdin.on('end', () => {
   const params = JSON.parse(input);
   
   if (toolName === 'analyze_code') {
-    // 执行分析逻辑
-    const result = analyzeCode(params.filePath, params.checkType);
-    console.log(JSON.stringify(result));
+    try {
+      // 执行分析逻辑
+      const result = analyzeCode(params.filePath, params.checkType);
+      // 成功时输出 JSON 结果到 stdout
+      console.log(JSON.stringify(result));
+      process.exit(0);
+    } catch (error) {
+      // 错误时输出到 stderr
+      console.error(error.message);
+      process.exit(1);
+    }
   }
 });
 ```
+
+调用命令的错误处理机制：
+- 退出码为 0 时，stdout 内容作为工具结果
+- 非零退出码、信号终止或 stderr 有输出时，返回详细错误信息
+- 错误信息包含：Stdout、Stderr、Error、Exit Code、Signal
 
 #### 3. 配置工具发现
 
@@ -104,9 +146,15 @@ process.stdin.on('end', () => {
 }
 ```
 
+发现的工具会被包装为 `DiscoveredTool` 实例，自动添加以下说明：
+- 工具来源信息
+- 执行命令详情
+- 配置说明
+- 错误处理说明
+
 ### 方式二：MCP 服务器
 
-Model Context Protocol (MCP) 提供了更强大的工具集成方式。
+Model Context Protocol (MCP) 提供了更强大的工具集成方式。MCP 客户端实现位于 `packages/core/src/tools/mcp-client.ts`，支持多种传输协议和高级特性。
 
 #### 1. 创建 MCP 服务器
 
@@ -171,6 +219,9 @@ await server.connect(transport);
 
 #### 2. 配置 MCP 服务器
 
+MCP 服务器支持多种配置方式和传输协议：
+
+##### 通过扩展配置
 在扩展的 `gemini-extension.json` 中配置：
 
 ```json
@@ -180,15 +231,80 @@ await server.connect(transport);
   "mcpServers": {
     "database": {
       "command": "node dist/my-mcp-server.js",
-      "environment": {
+      "args": ["--verbose"],
+      "env": {
         "DATABASE_URL": "${DATABASE_URL}"
       },
+      "cwd": "./server",
       "trust": false,
-      "timeout": 30000
+      "timeout": 30000,
+      "includeTools": ["database_query", "schema_info"],
+      "excludeTools": ["dangerous_operation"]
     }
   }
 }
 ```
+
+##### 通过设置文件配置
+在 `.gemini/settings.json` 中直接配置：
+
+```json
+{
+  "mcpServers": {
+    "http-server": {
+      "httpUrl": "https://api.example.com/mcp",
+      "headers": {
+        "API-Key": "${API_KEY}"
+      },
+      "timeout": 60000
+    },
+    "sse-server": {
+      "url": "https://sse.example.com/events",
+      "oauth": {
+        "enabled": true,
+        "authorizationUrl": "https://auth.example.com/authorize",
+        "tokenUrl": "https://auth.example.com/token",
+        "scopes": ["read", "write"]
+      }
+    }
+  }
+}
+```
+
+#### 3. 支持的传输协议
+
+MCP 客户端支持三种传输协议：
+
+1. **Stdio（标准输入输出）**：通过进程间通信
+   - 适合本地命令行工具
+   - 支持环境变量和工作目录配置
+   
+2. **SSE（Server-Sent Events）**：通过 HTTP 长连接
+   - 适合云服务集成
+   - 支持 OAuth 认证
+   
+3. **HTTP（Streamable HTTP）**：通过 HTTP 请求
+   - 适合 REST API 风格的服务
+   - 支持自定义请求头
+
+#### 4. OAuth 认证支持
+
+MCP 服务器支持自动 OAuth 发现和认证：
+
+```typescript
+// 服务器返回 401 时的 WWW-Authenticate 头
+response.headers['www-authenticate'] = 'Bearer realm="https://auth.example.com/.well-known/oauth"';
+
+// 自动发现 OAuth 配置并引导用户认证
+// 认证令牌会自动存储并在后续请求中使用
+```
+
+#### 5. 工具过滤和超时控制
+
+- **includeTools**：白名单模式，只包含指定工具
+- **excludeTools**：黑名单模式，排除指定工具（优先级更高）
+- **timeout**：工具调用超时时间（默认 10 分钟）
+- **trust**：是否信任该服务器（影响确认提示）
 
 ### 方式三：可修改工具
 
