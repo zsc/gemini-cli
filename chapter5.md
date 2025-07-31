@@ -51,6 +51,31 @@ async function getGeminiMdFilePathsInternal(
 3. **向下扫描**：使用 BFS 算法在项目内搜索
 4. **扩展文件**：加载扩展提供的上下文文件
 
+实现中使用 Set 数据结构来确保文件路径的唯一性：
+
+```typescript
+const allPaths = new Set<string>();
+const geminiMdFilenames = getAllGeminiMdFilenames();
+
+for (const geminiMdFilename of geminiMdFilenames) {
+  // 检查全局配置目录
+  const globalMemoryPath = path.join(
+    resolvedHome,
+    GEMINI_CONFIG_DIR,
+    geminiMdFilename,
+  );
+  
+  // 尝试访问全局文件
+  try {
+    await fs.access(globalMemoryPath, fsSync.constants.R_OK);
+    allPaths.add(globalMemoryPath);
+  } catch {
+    // 文件不存在或不可读
+  }
+  
+  // 继续向上和向下扫描...
+}
+
 ### 5.2.2 项目根目录识别
 
 系统通过查找 `.git` 目录来识别项目根目录：
@@ -77,6 +102,41 @@ async function findProjectRoot(startDir: string): Promise<string | null> {
 }
 ```
 
+向上扫描过程中的重要细节：
+
+```typescript
+// 确定扫描的终止目录
+const ultimateStopDir = projectRoot
+  ? path.dirname(projectRoot)
+  : path.dirname(resolvedHome);
+
+// 向上扫描逻辑
+while (currentDir && currentDir !== path.dirname(currentDir)) {
+  // 跳过全局 .gemini 目录，因为已经单独处理
+  if (currentDir === path.join(resolvedHome, GEMINI_CONFIG_DIR)) {
+    break;
+  }
+  
+  const potentialPath = path.join(currentDir, geminiMdFilename);
+  try {
+    await fs.access(potentialPath, fsSync.constants.R_OK);
+    // 仅在不是全局路径时添加
+    if (potentialPath !== globalMemoryPath) {
+      upwardPaths.unshift(potentialPath); // 保持层级顺序
+    }
+  } catch {
+    // 文件不存在或不可读
+  }
+  
+  // 到达终止目录时停止
+  if (currentDir === ultimateStopDir) {
+    break;
+  }
+  
+  currentDir = path.dirname(currentDir);
+}
+```
+
 ### 5.2.3 文件过滤选项
 
 Memory 系统支持文件过滤配置：
@@ -86,6 +146,118 @@ export const DEFAULT_MEMORY_FILE_FILTERING_OPTIONS: FileFilteringOptions = {
   respectGitIgnore: false,    // Memory 文件不受 .gitignore 影响
   respectGeminiIgnore: true,  // 但遵守 .geminiignore
 };
+```
+
+文件过滤由 FileDiscoveryService 类实现，它管理两种忽略规则：
+
+```typescript
+export class FileDiscoveryService {
+  private gitIgnoreFilter: GitIgnoreFilter | null = null;
+  private geminiIgnoreFilter: GitIgnoreFilter | null = null;
+  private projectRoot: string;
+
+  constructor(projectRoot: string) {
+    this.projectRoot = path.resolve(projectRoot);
+    
+    // 如果是 Git 仓库，加载 .gitignore 规则
+    if (isGitRepository(this.projectRoot)) {
+      const parser = new GitIgnoreParser(this.projectRoot);
+      try {
+        parser.loadGitRepoPatterns();
+      } catch (_error) {
+        // ignore file not found
+      }
+      this.gitIgnoreFilter = parser;
+    }
+    
+    // 始终尝试加载 .geminiignore 规则
+    const gParser = new GitIgnoreParser(this.projectRoot);
+    try {
+      gParser.loadPatterns(GEMINI_IGNORE_FILE_NAME);
+    } catch (_error) {
+      // ignore file not found
+    }
+    this.geminiIgnoreFilter = gParser;
+  }
+  
+  shouldIgnoreFile(
+    filePath: string,
+    options: FilterFilesOptions = {}
+  ): boolean {
+    const { respectGitIgnore = true, respectGeminiIgnore = true } = options;
+    
+    if (respectGitIgnore && this.shouldGitIgnoreFile(filePath)) {
+      return true;
+    }
+    if (respectGeminiIgnore && this.shouldGeminiIgnoreFile(filePath)) {
+      return true;
+    }
+    return false;
+  }
+}
+```
+
+### 5.2.4 BFS 文件搜索
+
+向下扫描使用广度优先搜索（BFS）算法实现高效的文件发现：
+
+```typescript
+export async function bfsFileSearch(
+  rootDir: string,
+  options: BfsFileSearchOptions,
+): Promise<string[]> {
+  const {
+    fileName,
+    ignoreDirs = [],
+    maxDirs = Infinity,
+    debug = false,
+    fileService,
+  } = options;
+  
+  const foundFiles: string[] = [];
+  const queue: string[] = [rootDir];
+  const visited = new Set<string>();
+  let scannedDirCount = 0;
+
+  while (queue.length > 0 && scannedDirCount < maxDirs) {
+    const currentDir = queue.shift()!;
+    if (visited.has(currentDir)) {
+      continue;
+    }
+    visited.add(currentDir);
+    scannedDirCount++;
+
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(currentDir, { withFileTypes: true });
+    } catch {
+      // 忽略无法读取的目录（如权限问题）
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      
+      // 应用文件过滤规则
+      if (fileService?.shouldIgnoreFile(fullPath, {
+        respectGitIgnore: options.fileFilteringOptions?.respectGitIgnore,
+        respectGeminiIgnore: options.fileFilteringOptions?.respectGeminiIgnore,
+      })) {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        if (!ignoreDirs.includes(entry.name)) {
+          queue.push(fullPath);
+        }
+      } else if (entry.isFile() && entry.name === fileName) {
+        foundFiles.push(fullPath);
+      }
+    }
+  }
+
+  return foundFiles;
+}
 ```
 
 ## 5.3 导入机制
@@ -124,6 +296,80 @@ export async function processImports(
 2. **深度限制**：默认最大导入深度为 10 层
 3. **路径验证**：防止路径遍历攻击
 4. **错误处理**：导入失败时插入错误注释
+
+导入处理的核心逻辑：
+
+```typescript
+// 导入语法的正则表达式，支持 @path/to/file.md 和 @./path/to/file.md
+const importRegex = /@([./]?[^\s\n]+\.[^\s\n]+)/g;
+
+let processedContent = content;
+let match: RegExpExecArray | null;
+
+while ((match = importRegex.exec(content)) !== null) {
+  const importPath = match[1];
+  
+  // 验证导入路径安全性
+  if (!validateImportPath(importPath, basePath, [basePath])) {
+    processedContent = processedContent.replace(
+      match[0],
+      `<!-- Import failed: ${importPath} - Path traversal attempt -->`,
+    );
+    continue;
+  }
+  
+  // 仅支持 .md 文件
+  if (!importPath.endsWith('.md')) {
+    logger.warn(
+      `Import processor only supports .md files. Attempting to import non-md file: ${importPath}`,
+    );
+    processedContent = processedContent.replace(
+      match[0],
+      `<!-- Import failed: ${importPath} - Only .md files are supported -->`,
+    );
+    continue;
+  }
+  
+  const fullPath = path.resolve(basePath, importPath);
+  
+  // 检查循环导入
+  if (importState.processedFiles.has(fullPath)) {
+    processedContent = processedContent.replace(
+      match[0],
+      `<!-- Import skipped: ${importPath} - Already imported (circular dependency) -->`,
+    );
+    continue;
+  }
+  
+  try {
+    // 读取并递归处理导入的文件
+    const importedContent = await fs.readFile(fullPath, 'utf-8');
+    const processedImportedContent = await processImports(
+      importedContent,
+      path.dirname(fullPath),
+      debugMode,
+      {
+        ...importState,
+        processedFiles: new Set([...importState.processedFiles, fullPath]),
+        currentDepth: importState.currentDepth + 1,
+        currentFile: fullPath,
+      },
+    );
+    
+    // 替换导入语句为处理后的内容
+    processedContent = processedContent.replace(
+      match[0],
+      `<!-- Imported from: ${importPath} -->\n${processedImportedContent}\n<!-- End of import from: ${importPath} -->`,
+    );
+  } catch (error) {
+    // 处理导入错误
+    processedContent = processedContent.replace(
+      match[0],
+      `<!-- Import failed: ${importPath} - ${errorMessage} -->`,
+    );
+  }
+}
+```
 
 ### 5.3.3 安全性考虑
 
@@ -194,19 +440,62 @@ static async performAddMemoryEntry(
   memoryFilePath: string,
   fsAdapter: FileSystemAdapter,
 ): Promise<void> {
-  // 确保正确的换行分隔
-  const separator = ensureNewlineSeparation(content);
+  let processedText = text.trim();
+  // 移除可能被误解为 Markdown 列表项的前导连字符
+  processedText = processedText.replace(/^(-+\s*)+/, '').trim();
+  const newMemoryItem = `- ${processedText}`;
   
-  // 查找或创建 Memory 部分
-  const headerIndex = content.indexOf(MEMORY_SECTION_HEADER);
-  
-  if (headerIndex === -1) {
-    // 添加新部分
-    content += `${separator}${MEMORY_SECTION_HEADER}\n${newMemoryItem}\n`;
-  } else {
-    // 追加到现有部分
-    // ...
+  try {
+    await fsAdapter.mkdir(path.dirname(memoryFilePath), { recursive: true });
+    let content = '';
+    try {
+      content = await fsAdapter.readFile(memoryFilePath, 'utf-8');
+    } catch (_e) {
+      // 文件不存在，将创建带有标题和条目的新文件
+    }
+    
+    const headerIndex = content.indexOf(MEMORY_SECTION_HEADER);
+    
+    if (headerIndex === -1) {
+      // 未找到标题，追加标题和条目
+      const separator = ensureNewlineSeparation(content);
+      content += `${separator}${MEMORY_SECTION_HEADER}\n${newMemoryItem}\n`;
+    } else {
+      // 找到标题，在适当位置插入新条目
+      const beforeHeader = content.substring(0, headerIndex);
+      const fromHeader = content.substring(headerIndex);
+      
+      // 在标题后查找第一个非空行
+      const lines = fromHeader.split('\n');
+      let insertIndex = 1; // 标题后的第一行
+      
+      // 跳过空行
+      while (insertIndex < lines.length && lines[insertIndex].trim() === '') {
+        insertIndex++;
+      }
+      
+      // 在标题和第一个内容之间插入新条目
+      lines.splice(insertIndex, 0, newMemoryItem);
+      content = beforeHeader + lines.join('\n');
+    }
+    
+    await fsAdapter.writeFile(memoryFilePath, content, 'utf-8');
+  } catch (error) {
+    throw new Error(`Failed to save memory: ${error}`);
   }
+}
+```
+
+辅助函数 `ensureNewlineSeparation` 确保内容之间有适当的分隔：
+
+```typescript
+function ensureNewlineSeparation(currentContent: string): string {
+  if (currentContent.length === 0) return '';
+  if (currentContent.endsWith('\n\n') || currentContent.endsWith('\r\n\r\n'))
+    return '';
+  if (currentContent.endsWith('\n') || currentContent.endsWith('\r\n'))
+    return '\n';
+  return '\n\n';
 }
 ```
 
@@ -270,14 +559,83 @@ Memory 内容作为后缀追加到系统提示词：
 
 ```typescript
 export function getCoreSystemPrompt(userMemory?: string): string {
-  const basePrompt = /* ... 基础提示词 ... */;
+  // 支持通过环境变量覆盖系统提示词
+  let systemMdEnabled = false;
+  let systemMdPath = path.resolve(path.join(GEMINI_CONFIG_DIR, 'system.md'));
+  const systemMdVar = process.env.GEMINI_SYSTEM_MD;
   
+  if (systemMdVar) {
+    const systemMdVarLower = systemMdVar.toLowerCase();
+    if (!['0', 'false'].includes(systemMdVarLower)) {
+      systemMdEnabled = true;
+      if (!['1', 'true'].includes(systemMdVarLower)) {
+        // 使用自定义路径
+        let customPath = systemMdVar;
+        if (customPath.startsWith('~/')) {
+          customPath = path.join(os.homedir(), customPath.slice(2));
+        }
+        systemMdPath = path.resolve(customPath);
+      }
+      // 覆盖启用时要求文件存在
+      if (!fs.existsSync(systemMdPath)) {
+        throw new Error(`missing system prompt file '${systemMdPath}'`);
+      }
+    }
+  }
+  
+  const basePrompt = systemMdEnabled
+    ? fs.readFileSync(systemMdPath, 'utf8')
+    : /* 默认系统提示词 */;
+  
+  // Memory 内容作为后缀追加
   const memorySuffix =
     userMemory && userMemory.trim().length > 0
       ? `\n\n---\n\n${userMemory.trim()}`
       : '';
       
   return `${basePrompt}${memorySuffix}`;
+}
+```
+
+### 5.6.3 Memory 内容加载流程
+
+完整的 Memory 内容加载流程由 `loadServerHierarchicalMemory` 函数协调：
+
+```typescript
+export async function loadServerHierarchicalMemory(
+  currentWorkingDirectory: string,
+  debugMode: boolean,
+  fileService: FileDiscoveryService,
+  extensionContextFilePaths: string[] = [],
+  fileFilteringOptions?: FileFilteringOptions,
+  maxDirs: number = 200,
+): Promise<{ memoryContent: string; fileCount: number }> {
+  // 1. 发现所有相关的 GEMINI.md 文件
+  const userHomePath = homedir();
+  const filePaths = await getGeminiMdFilePathsInternal(
+    currentWorkingDirectory,
+    userHomePath,
+    debugMode,
+    fileService,
+    extensionContextFilePaths,
+    fileFilteringOptions || DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
+    maxDirs,
+  );
+  
+  if (filePaths.length === 0) {
+    return { memoryContent: '', fileCount: 0 };
+  }
+  
+  // 2. 读取文件并处理导入
+  const contentsWithPaths = await readGeminiMdFiles(filePaths, debugMode);
+  
+  // 3. 连接所有内容，添加源标记
+  const combinedInstructions = concatenateInstructions(
+    contentsWithPaths,
+    currentWorkingDirectory,
+  );
+  
+  return { memoryContent: combinedInstructions, fileCount: filePaths.length };
 }
 ```
 
