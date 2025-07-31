@@ -31,7 +31,7 @@ Gemini CLI 提供了一套完整的文件操作工具，位于 `packages/core/sr
 ReadFileTool.Name = 'read_file';
 WriteFileTool.Name = 'write_file';
 EditTool.Name = 'replace';
-GlobTool.Name = 'list_files';
+GlobTool.Name = 'glob';  // 实际名称是 'glob'，而非 'list_files'
 GrepTool.Name = 'search_file_content';
 ```
 
@@ -57,8 +57,8 @@ abstract class BaseTool<TParams, TResult> {
 
 // 修改类工具的特殊接口
 interface ModifiableTool<TParams> {
-  // 用户修改参数后的回调
-  onUserModifiedParams?(context: ModifyContext): Promise<void>;
+  // 获取修改上下文，支持外部编辑器集成
+  getModifyContext(abortSignal: AbortSignal): ModifyContext<TParams>;
 }
 ```
 
@@ -97,6 +97,37 @@ const schema = {
 };
 ```
 
+### 15.1.4 ModifyContext 接口详解
+
+`ModifiableTool` 通过 `ModifyContext` 接口支持用户介入和外部编辑器集成：
+
+```typescript
+export interface ModifyContext<ToolParams> {
+  // 获取操作的文件路径
+  getFilePath: (params: ToolParams) => string;
+  
+  // 获取当前文件内容
+  getCurrentContent: (params: ToolParams) => Promise<string>;
+  
+  // 获取提议的新内容
+  getProposedContent: (params: ToolParams) => Promise<string>;
+  
+  // 根据用户修改创建新的参数
+  createUpdatedParams: (
+    oldContent: string,
+    modifiedProposedContent: string,
+    originalParams: ToolParams,
+  ) => ToolParams;
+}
+```
+
+外部编辑器集成的工作流程：
+1. 创建临时文件保存当前内容和提议内容
+2. 启动用户配置的 diff 编辑器（如 VSCode、Vim）
+3. 用户在编辑器中修改提议内容
+4. 读取修改后的内容并更新工具参数
+5. 生成新的差异供确认
+
 ## 15.2 文件读取工作流
 
 ### 15.2.1 ReadFileTool 实现
@@ -128,17 +159,25 @@ class ReadFileTool extends BaseTool<ReadFileToolParams, ToolResult> {
     const errors = SchemaValidator.validate(this.schema.parameters, params);
     if (errors) return errors;
     
-    // 2. 路径验证
+    // 2. 路径验证 - 必须是绝对路径
     if (!path.isAbsolute(params.absolute_path)) {
-      return `File path must be absolute, but was relative: ${params.absolute_path}`;
+      return `File path must be absolute, but was relative: ${params.absolute_path}. You must provide an absolute path.`;
     }
     
-    // 3. 安全性验证
+    // 3. 安全性验证 - 必须在根目录内
     if (!isWithinRoot(params.absolute_path, this.config.getTargetDir())) {
-      return `File path must be within the root directory`;
+      return `File path must be within the root directory (${this.config.getTargetDir()}): ${params.absolute_path}`;
     }
     
-    // 4. .geminiignore 检查
+    // 4. 参数范围验证
+    if (params.offset !== undefined && params.offset < 0) {
+      return 'Offset must be a non-negative number';
+    }
+    if (params.limit !== undefined && params.limit <= 0) {
+      return 'Limit must be a positive number';
+    }
+    
+    // 5. .geminiignore 检查
     const fileService = this.config.getFileService();
     if (fileService.shouldGeminiIgnoreFile(params.absolute_path)) {
       return `File path is ignored by .geminiignore pattern(s).`;
@@ -189,6 +228,12 @@ class ReadFileTool extends BaseTool<ReadFileToolParams, ToolResult> {
 }
 ```
 
+值得注意的验证细节：
+- **路径格式**：强制要求绝对路径，拒绝相对路径，避免歧义
+- **安全边界**：使用 `isWithinRoot` 函数确保文件访问不越界
+- **参数合理性**：offset 必须非负，limit 必须为正
+- **忽略模式**：支持 `.geminiignore` 文件过滤敏感文件
+
 ### 15.2.2 文件类型检测与处理
 
 `fileUtils.ts` 中的文件类型检测系统基于文件扩展名和内容分析：
@@ -230,7 +275,45 @@ export async function processSingleFileContent(
       return processSvgFile(filePath);
   }
 }
+
+// 文件类型检测的核心逻辑
+export async function detectFileType(
+  filePath: string
+): Promise<'text' | 'image' | 'pdf' | 'audio' | 'video' | 'binary' | 'svg'> {
+  const ext = path.extname(filePath).toLowerCase();
+
+  // 特殊处理：.ts 文件视为 TypeScript 而非 MPEG 传输流
+  if (ext === '.ts') {
+    return 'text';
+  }
+
+  // SVG 文件特殊处理（因为 MIME 类型可能是 image/svg+xml）
+  if (ext === '.svg') {
+    return 'svg';
+  }
+
+  // 基于 MIME 类型判断
+  const lookedUpMimeType = mime.lookup(filePath);
+  if (lookedUpMimeType) {
+    if (lookedUpMimeType.startsWith('image/')) return 'image';
+    if (lookedUpMimeType.startsWith('audio/')) return 'audio';
+    if (lookedUpMimeType.startsWith('video/')) return 'video';
+    if (lookedUpMimeType === 'application/pdf') return 'pdf';
+  }
+
+  // 内容检测：通过读取前 4KB 判断是否为二进制文件
+  if (await isBinaryFile(filePath)) {
+    return 'binary';
+  }
+
+  return 'text';
+}
 ```
+
+文件类型检测的优先级：
+1. **扩展名特例**：`.ts` 强制为文本，`.svg` 特殊处理
+2. **MIME 类型**：使用 `mime-types` 库进行标准检测
+3. **内容分析**：对于无法确定的文件，读取内容判断是否二进制
 
 ### 15.2.3 文本文件处理细节
 
@@ -267,6 +350,63 @@ function processTextFile(filePath: string, offset?: number, limit?: number) {
   return { llmContent, originalLineCount: lines.length };
 }
 ```
+
+关键的处理策略：
+- **默认限制**：不指定 limit 时最多读取 2000 行
+- **行长限制**：单行超过 2000 字符会被截断
+- **明确提示**：当文件被截断时，清楚说明显示的行号范围
+
+### 15.2.4 二进制文件检测
+
+`isBinaryFile` 函数通过内容采样判断文件是否为二进制：
+
+```typescript
+export async function isBinaryFile(filePath: string): Promise<boolean> {
+  let fileHandle: fs.promises.FileHandle | undefined;
+  try {
+    fileHandle = await fs.promises.open(filePath, 'r');
+
+    // 读取最多 4KB 或文件大小（取小者）
+    const stats = await fileHandle.stat();
+    const fileSize = stats.size;
+    if (fileSize === 0) return false; // 空文件视为文本
+    
+    const bufferSize = Math.min(4096, fileSize);
+    const buffer = Buffer.alloc(bufferSize);
+    const result = await fileHandle.read(buffer, 0, buffer.length, 0);
+    const bytesRead = result.bytesRead;
+
+    if (bytesRead === 0) return false;
+
+    let nonPrintableCount = 0;
+    for (let i = 0; i < bytesRead; i++) {
+      if (buffer[i] === 0) return true; // NULL 字节是强指示器
+      if (buffer[i] < 9 || (buffer[i] > 13 && buffer[i] < 32)) {
+        nonPrintableCount++;
+      }
+    }
+    
+    // 如果超过 30% 是不可打印字符，视为二进制
+    return nonPrintableCount / bytesRead > 0.3;
+  } catch (error) {
+    console.warn(`Failed to check if file is binary: ${filePath}`, error);
+    return false; // 出错时默认当作文本处理
+  } finally {
+    if (fileHandle) {
+      try {
+        await fileHandle.close();
+      } catch (closeError) {
+        console.warn(`Failed to close file handle for: ${filePath}`, closeError);
+      }
+    }
+  }
+}
+```
+
+检测策略：
+1. **NULL 字节**：发现 NULL 字节立即判定为二进制
+2. **不可打印字符比例**：超过 30% 视为二进制
+3. **容错处理**：读取失败时默认当作文本，避免阻断操作
 
 ## 15.3 文件写入与编辑工作流
 
